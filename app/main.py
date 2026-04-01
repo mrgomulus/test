@@ -1,341 +1,392 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import datetime, timedelta
-from threading import Event, Thread
+import logging
+from typing import Any, Optional
 
-import pandas as pd
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.auth import change_password, ensure_default_admin, get_user_by_session, login, test_ad_connection
-from app.database import get_conn, get_setting, init_db, set_setting, utcnow
-from app.predictor import run_prediction
+from app.database import get_conn, init_db, utcnow
+from app.opcua_client import opcua_manager
 
-app = FastAPI(title="Lokales Störungsmanagement")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="OPC UA Browser")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
-stop_event = Event()
 
 
-def background_predictor() -> None:
-    while not stop_event.is_set():
-        if get_setting("ai.enabled", True):
-            run_prediction()
-        refresh_hours = int(get_setting("ai.refresh_hours", 6))
-        stop_event.wait(timeout=max(1, refresh_hours) * 3600)
+def _safe_err(exc: Exception) -> str:
+    """Return a safe error message that does not expose internal paths or stack traces."""
+    return type(exc).__name__
 
 
-def current_user(request: Request):
-    token = request.cookies.get("session")
-    user = get_user_by_session(token) if token else None
-    if not user:
-        raise HTTPException(status_code=401)
-    return user
+# ── Startup ───────────────────────────────────────────────────────────────────
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
-    ensure_default_admin()
-    defaults = {
-        "preview.enabled": False,
-        "evaluation.default_weeks": 6,
-        "evaluation.top_n": 10,
-        "ai.enabled": True,
-        "ai.months": 6,
-        "ai.refresh_hours": 6,
-        "ai.model_path": "models/qwen",
-        "auth.ad": {"enabled": False},
-    }
-    for key, value in defaults.items():
-        if get_setting(key, None) is None:
-            set_setting(key, value)
-    Thread(target=background_predictor, daemon=True).start()
 
 
-@app.on_event("shutdown")
-def shutdown() -> None:
-    stop_event.set()
+# ── Frontend shell ────────────────────────────────────────────────────────────
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
+async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
-@app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+# ── Connections CRUD ──────────────────────────────────────────────────────────
 
 
-@app.post("/login", response_class=HTMLResponse)
-def do_login(request: Request, username: str = Form(...), password: str = Form(...)):
-    token = login(username, password)
-    if not token:
-        return templates.TemplateResponse("login.html", {"request": request, "error": "Login fehlgeschlagen"})
-    response = RedirectResponse("/app", status_code=302)
-    response.set_cookie("session", token, httponly=True)
-    return response
-
-
-@app.get("/app", response_class=HTMLResponse)
-def app_shell(request: Request, user=Depends(current_user)):
-    return templates.TemplateResponse("app.html", {"request": request, "user": user})
-
-
-@app.post("/auth/change-password")
-def do_change_password(new_password: str = Form(...), user=Depends(current_user)):
-    change_password(user.username, new_password)
-    return {"status": "ok"}
-
-
-@app.post("/api/import")
-async def import_excel(file: UploadFile = File(...), user=Depends(current_user)):
-    df = pd.read_excel(file.file)
-    conn = get_conn()
-    inserted = 0
-    try:
-        for _, row in df.iterrows():
-            conn.execute(
-                """
-                INSERT INTO disturbances(
-                  stoerung_text, anlage, teilanlage_id, ursache, behebung, dauer_minuten,
-                  kategorie, bereitschaft, berechtigter_einsatz, verantwortlicher, event_time, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(row.get("stoerung_text", "")),
-                    str(row.get("anlage", "")),
-                    row.get("teilanlage_id"),
-                    str(row.get("ursache", "")),
-                    str(row.get("behebung", "")),
-                    int(row.get("dauer_minuten", 0) or 0),
-                    str(row.get("kategorie", "")),
-                    str(row.get("bereitschaft", "")),
-                    str(row.get("berechtigter_einsatz", "")),
-                    str(row.get("verantwortlicher", "")),
-                    str(row.get("event_time", utcnow())),
-                    utcnow(),
-                ),
-            )
-            inserted += 1
-        conn.commit()
-    finally:
-        conn.close()
-    return {"inserted": inserted}
-
-
-@app.get("/api/disturbances")
-def search_disturbances(
-    q: str = "",
-    line_id: int | None = None,
-    subplant_id: int | None = None,
-    category: str | None = None,
-    responsible: str | None = None,
-    min_duration: int | None = None,
-    max_duration: int | None = None,
-    start: str | None = None,
-    end: str | None = None,
-    page: int = 1,
-    page_size: int = 50,
-    user=Depends(current_user),
-):
-    query = """
-    SELECT d.*, sp.name as subplant_name
-    FROM disturbances d
-    LEFT JOIN subplants sp ON sp.id = d.teilanlage_id
-    LEFT JOIN line_subplant ls ON ls.subplant_id = d.teilanlage_id
-    WHERE 1=1
-    """
-    params: list = []
-
-    if q:
-        query += " AND d.id IN (SELECT rowid FROM disturbances_fts WHERE disturbances_fts MATCH ?)"
-        params.append(q)
-    if line_id:
-        query += " AND ls.line_id = ?"
-        params.append(line_id)
-    if subplant_id:
-        query += " AND d.teilanlage_id = ?"
-        params.append(subplant_id)
-    if category:
-        query += " AND d.kategorie = ?"
-        params.append(category)
-    if responsible:
-        query += " AND d.verantwortlicher LIKE ?"
-        params.append(f"%{responsible}%")
-    if min_duration is not None:
-        query += " AND d.dauer_minuten >= ?"
-        params.append(min_duration)
-    if max_duration is not None:
-        query += " AND d.dauer_minuten <= ?"
-        params.append(max_duration)
-    if start:
-        query += " AND d.event_time >= ?"
-        params.append(start)
-    if end:
-        query += " AND d.event_time <= ?"
-        params.append(end)
-
-    query += " ORDER BY d.event_time DESC LIMIT ? OFFSET ?"
-    params.extend([page_size, (page - 1) * page_size])
-
+@app.get("/api/connections")
+def list_connections():
     conn = get_conn()
     try:
-        rows = [dict(r) for r in conn.execute(query, params).fetchall()]
-        return rows
+        rows = conn.execute(
+            "SELECT id, name, url, username, security_mode, security_policy, "
+            "timeout, description, created_at, updated_at FROM connections ORDER BY name"
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["connected"] = opcua_manager.is_connected(d["id"])
+            result.append(d)
+        return result
     finally:
         conn.close()
 
 
-@app.post("/api/disturbances")
-def create_disturbance(payload: dict, user=Depends(current_user)):
+@app.post("/api/connections", status_code=201)
+def create_connection(payload: dict):
+    now = utcnow()
     conn = get_conn()
     try:
-        conn.execute(
-            """
-            INSERT INTO disturbances(stoerung_text, anlage, teilanlage_id, ursache, behebung, dauer_minuten,
-            kategorie, bereitschaft, berechtigter_einsatz, verantwortlicher, event_time, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+        cur = conn.execute(
+            "INSERT INTO connections(name, url, username, password, security_mode, "
+            "security_policy, timeout, description, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
-                payload.get("stoerung_text"),
-                payload.get("anlage"),
-                payload.get("teilanlage_id"),
-                payload.get("ursache"),
-                payload.get("behebung"),
-                payload.get("dauer_minuten", 0),
-                payload.get("kategorie"),
-                payload.get("bereitschaft"),
-                payload.get("berechtigter_einsatz"),
-                payload.get("verantwortlicher"),
-                payload.get("event_time", utcnow()),
-                utcnow(),
+                payload.get("name", "New Connection"),
+                payload.get("url", "opc.tcp://localhost:4840"),
+                payload.get("username", ""),
+                payload.get("password", ""),
+                payload.get("security_mode", 1),
+                payload.get("security_policy", "None"),
+                payload.get("timeout", 10),
+                payload.get("description", ""),
+                now,
+                now,
             ),
         )
         conn.commit()
-    finally:
-        conn.close()
-    return {"status": "ok"}
-
-
-@app.get("/api/master-data")
-def master_data(user=Depends(current_user)):
-    conn = get_conn()
-    try:
-        lines = [dict(x) for x in conn.execute("SELECT * FROM lines WHERE active = 1 ORDER BY name").fetchall()]
-        subplants = [dict(x) for x in conn.execute("SELECT * FROM subplants WHERE active = 1 ORDER BY name").fetchall()]
-        mapping = [dict(x) for x in conn.execute("SELECT * FROM line_subplant").fetchall()]
-        return {"lines": lines, "subplants": subplants, "mapping": mapping}
+        row = conn.execute(
+            "SELECT id, name, url, username, security_mode, security_policy, "
+            "timeout, description, created_at, updated_at FROM connections WHERE id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        d = dict(row)
+        d["connected"] = False
+        return JSONResponse(d, status_code=201)
     finally:
         conn.close()
 
 
-@app.get("/api/analytics")
-def analytics(user=Depends(current_user)):
-    weeks = int(get_setting("evaluation.default_weeks", 6))
-    since = (datetime.utcnow() - timedelta(weeks=weeks)).isoformat()
+@app.put("/api/connections/{conn_id}")
+def update_connection(conn_id: int, payload: dict):
+    now = utcnow()
     conn = get_conn()
     try:
-        top = [
-            dict(x)
-            for x in conn.execute(
-                """
-                SELECT COALESCE(sp.name, 'Unbekannt') as subplant, COUNT(*) as count,
-                       SUM(COALESCE(d.dauer_minuten,0)) as total_duration,
-                       AVG(COALESCE(d.dauer_minuten,0)) as avg_duration
-                FROM disturbances d
-                LEFT JOIN subplants sp ON sp.id = d.teilanlage_id
-                WHERE d.event_time >= ?
-                GROUP BY COALESCE(sp.name, 'Unbekannt')
-                ORDER BY count DESC
-                LIMIT ?
-                """,
-                (since, int(get_setting("evaluation.top_n", 10))),
-            ).fetchall()
-        ]
-        categories = [
-            dict(x)
-            for x in conn.execute(
-                "SELECT COALESCE(kategorie,'Unbekannt') as category, COUNT(*) as count FROM disturbances WHERE event_time >= ? GROUP BY COALESCE(kategorie,'Unbekannt')",
-                (since,),
-            ).fetchall()
-        ]
-        trend = [
-            dict(x)
-            for x in conn.execute(
-                "SELECT substr(event_time,1,10) as day, COUNT(*) as count FROM disturbances WHERE event_time >= ? GROUP BY substr(event_time,1,10) ORDER BY day",
-                (since,),
-            ).fetchall()
-        ]
-        pred = conn.execute("SELECT * FROM predictions ORDER BY created_at DESC LIMIT 1").fetchone()
-        prediction = dict(pred) if pred else None
-        if prediction:
-            prediction["prediction_json"] = json.loads(prediction["prediction_json"])
-        return {"top": top, "categories": categories, "trend": trend, "prediction": prediction}
+        row = conn.execute(
+            "SELECT id FROM connections WHERE id=?", (conn_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        conn.execute(
+            "UPDATE connections SET name=?, url=?, username=?, password=?, "
+            "security_mode=?, security_policy=?, timeout=?, description=?, updated_at=? "
+            "WHERE id=?",
+            (
+                payload.get("name"),
+                payload.get("url"),
+                payload.get("username", ""),
+                payload.get("password", ""),
+                payload.get("security_mode", 1),
+                payload.get("security_policy", "None"),
+                payload.get("timeout", 10),
+                payload.get("description", ""),
+                now,
+                conn_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, name, url, username, security_mode, security_policy, "
+            "timeout, description, created_at, updated_at FROM connections WHERE id=?",
+            (conn_id,),
+        ).fetchone()
+        d = dict(row)
+        d["connected"] = opcua_manager.is_connected(conn_id)
+        return d
     finally:
         conn.close()
 
 
-@app.post("/api/settings/ad-test")
-def ad_test(payload: dict, user=Depends(current_user)):
-    ok, message = test_ad_connection(
-        payload.get("server", ""),
-        payload.get("domain", ""),
-        payload.get("username", ""),
-        payload.get("password", ""),
-    )
-    return {"ok": ok, "message": message}
-
-
-@app.post("/api/settings")
-def save_settings(payload: dict, user=Depends(current_user)):
-    for key, value in payload.items():
-        set_setting(key, value)
-    return {"status": "ok"}
-
-
-@app.get("/api/settings")
-def list_settings(user=Depends(current_user)):
-    keys = [
-        "preview.enabled",
-        "evaluation.default_weeks",
-        "evaluation.top_n",
-        "ai.enabled",
-        "ai.months",
-        "ai.refresh_hours",
-        "ai.model_path",
-        "auth.ad",
-    ]
-    return {k: get_setting(k) for k in keys}
-
-
-@app.post("/api/preview/dummy")
-def create_dummy_data(user=Depends(current_user)):
-    if not get_setting("preview.enabled", False):
-        return JSONResponse({"error": "Preview mode ist deaktiviert"}, status_code=400)
-
+@app.delete("/api/connections/{conn_id}", status_code=204)
+async def delete_connection(conn_id: int):
+    await opcua_manager.disconnect(conn_id)
     conn = get_conn()
     try:
-        for i in range(30):
-            conn.execute(
-                "INSERT INTO disturbances(stoerung_text, anlage, ursache, behebung, dauer_minuten, kategorie, verantwortlicher, event_time, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    f"Dummy Störung {i}",
-                    "Preview Anlage",
-                    "Simulierte Ursache",
-                    "Simulierte Behebung",
-                    10 + i,
-                    "Preview",
-                    "System",
-                    (datetime.utcnow() - timedelta(days=i)).isoformat(),
-                    utcnow(),
-                ),
-            )
+        conn.execute("DELETE FROM connections WHERE id=?", (conn_id,))
         conn.commit()
     finally:
         conn.close()
-    return {"status": "ok", "rows": 30}
+
+
+# ── OPC UA connect / disconnect ───────────────────────────────────────────────
+
+
+@app.post("/api/connections/{conn_id}/connect")
+async def connect_server(conn_id: int):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT url, username, password, security_mode, security_policy, timeout "
+            "FROM connections WHERE id=?",
+            (conn_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        r = dict(row)
+    finally:
+        conn.close()
+
+    try:
+        info = await opcua_manager.connect(
+            conn_id=conn_id,
+            url=r["url"],
+            username=r["username"] or "",
+            password=r["password"] or "",
+            timeout=r["timeout"] or 10,
+            security_mode=r["security_mode"] or 1,
+            security_policy=r["security_policy"] or "None",
+        )
+        return info
+    except Exception as exc:
+        logger.warning("OPC UA error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+@app.post("/api/connections/{conn_id}/disconnect")
+async def disconnect_server(conn_id: int):
+    await opcua_manager.disconnect(conn_id)
+    return {"status": "disconnected"}
+
+
+@app.get("/api/connections/{conn_id}/status")
+async def connection_status(conn_id: int):
+    if not opcua_manager.is_connected(conn_id):
+        return {"connected": False}
+    try:
+        info = await opcua_manager.get_server_info(conn_id)
+        info["connected"] = True
+        return info
+    except Exception as exc:
+        logger.warning("Server info error: %s", exc)
+        return {"connected": False, "error": _safe_err(exc)}
+
+
+# ── Browse ────────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/browse")
+async def browse(conn_id: int, node_id: Optional[str] = None):
+    _require_connection(conn_id)
+    try:
+        return await opcua_manager.browse(conn_id, node_id)
+    except Exception as exc:
+        logger.warning("OPC UA error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+# ── Attributes ────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/attributes")
+async def get_attributes(conn_id: int, node_id: str):
+    _require_connection(conn_id)
+    try:
+        return await opcua_manager.get_attributes(conn_id, node_id)
+    except Exception as exc:
+        logger.warning("OPC UA error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+# ── Read ──────────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/read")
+async def read_value(conn_id: int, node_id: str):
+    _require_connection(conn_id)
+    try:
+        return await opcua_manager.read_value(conn_id, node_id)
+    except Exception as exc:
+        logger.warning("OPC UA error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+# ── Write ─────────────────────────────────────────────────────────────────────
+
+
+@app.post("/api/write")
+async def write_value(payload: dict):
+    conn_id: int = payload.get("conn_id")
+    node_id: str = payload.get("node_id", "")
+    value: Any = payload.get("value")
+    dt_hint: Optional[str] = payload.get("data_type")
+    _require_connection(conn_id)
+    try:
+        return await opcua_manager.write_value(conn_id, node_id, value, dt_hint)
+    except Exception as exc:
+        logger.warning("OPC UA error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+# ── Method call ───────────────────────────────────────────────────────────────
+
+
+@app.post("/api/call-method")
+async def call_method(payload: dict):
+    conn_id: int = payload.get("conn_id")
+    parent_id: str = payload.get("parent_id", "")
+    method_id: str = payload.get("method_id", "")
+    args: list = payload.get("args", [])
+    _require_connection(conn_id)
+    try:
+        result = await opcua_manager.call_method(conn_id, parent_id, method_id, args)
+        return {"result": result}
+    except Exception as exc:
+        logger.warning("OPC UA error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+# ── Favorites ─────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/favorites")
+def list_favorites(conn_id: int):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM favorites WHERE conn_id=? ORDER BY display_name",
+            (conn_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/api/favorites", status_code=201)
+def add_favorite(payload: dict):
+    conn_id = payload.get("conn_id")
+    node_id = payload.get("node_id", "")
+    if not conn_id or not node_id:
+        raise HTTPException(status_code=422, detail="conn_id and node_id required")
+    now = utcnow()
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites(conn_id, node_id, display_name, "
+            "browse_name, node_class, data_type, created_at) VALUES(?,?,?,?,?,?,?)",
+            (
+                conn_id,
+                node_id,
+                payload.get("display_name", ""),
+                payload.get("browse_name", ""),
+                payload.get("node_class", ""),
+                payload.get("data_type", ""),
+                now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM favorites WHERE conn_id=? AND node_id=?",
+            (conn_id, node_id),
+        ).fetchone()
+        return JSONResponse(dict(row), status_code=201)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/favorites/{fav_id}", status_code=204)
+def delete_favorite(fav_id: int):
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM favorites WHERE id=?", (fav_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── WebSocket subscriptions ───────────────────────────────────────────────────
+
+
+@app.websocket("/ws/{conn_id}")
+async def websocket_endpoint(websocket: WebSocket, conn_id: int):
+    await websocket.accept()
+    if not opcua_manager.is_connected(conn_id):
+        await websocket.send_json({"error": "Not connected"})
+        await websocket.close()
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def sender():
+        while True:
+            msg = await queue.get()
+            try:
+                await websocket.send_json(msg)
+            except Exception:
+                return
+
+    sender_task = asyncio.create_task(sender())
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            msg = json.loads(raw)
+            action = msg.get("action")
+            node_id = msg.get("node_id", "")
+            if action == "subscribe" and node_id:
+                try:
+                    await opcua_manager.subscribe(conn_id, node_id, queue)
+                    await websocket.send_json(
+                        {"type": "subscribed", "node_id": node_id}
+                    )
+                except Exception as exc:
+                    await websocket.send_json(
+                        {"type": "error", "node_id": node_id, "message": _safe_err(exc)}
+                    )
+            elif action == "unsubscribe" and node_id:
+                await opcua_manager.unsubscribe(conn_id, node_id)
+                await websocket.send_json(
+                    {"type": "unsubscribed", "node_id": node_id}
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sender_task.cancel()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _require_connection(conn_id: Any) -> None:
+    if not conn_id or not opcua_manager.is_connected(int(conn_id)):
+        raise HTTPException(
+            status_code=400, detail="Not connected to this OPC UA server"
+        )
