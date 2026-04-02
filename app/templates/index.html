@@ -18,6 +18,9 @@
     </svg>
     OPC UA Browser
   </div>
+  <div id="topbar-actions">
+    <button id="btn-open-diagnostics" class="icon-btn" title="Server-Diagnose anzeigen" style="display:none">&#128202; Diagnose</button>
+  </div>
   <div id="status-bar">
     <span id="status-text" class="status-idle">Keine aktive Verbindung</span>
   </div>
@@ -47,7 +50,11 @@
   <section id="tree-panel">
     <div class="panel-toolbar">
       <span class="panel-title">Adressraum</span>
-      <button id="btn-refresh-tree" class="icon-btn" title="Aktualisieren">&#8635;</button>
+      <div style="display:flex;gap:4px;align-items:center">
+        <input id="tree-search" type="text" placeholder="Knoten-ID suchen&#8230;" style="background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:4px;font-size:11.5px;width:160px;outline:none" />
+        <button id="btn-tree-search" class="icon-btn" title="Suchen">&#128269;</button>
+        <button id="btn-refresh-tree" class="icon-btn" title="Aktualisieren">&#8635;</button>
+      </div>
     </div>
     <div id="tree-container">
       <p class="hint">Verbindung herstellen um den Adressraum zu browsen</p>
@@ -64,6 +71,8 @@
       <button class="tab-btn active" data-tab="attributes">Attribute</button>
       <button class="tab-btn" data-tab="value">Wert</button>
       <button class="tab-btn" data-tab="references">Referenzen</button>
+      <button class="tab-btn" data-tab="history">Verlauf</button>
+      <button class="tab-btn" data-tab="nodediag">Diagnose</button>
     </div>
     <div id="detail-content">
       <p class="hint">Knoten auswaehlen</p>
@@ -90,7 +99,17 @@
     </div>
     <div class="modal-body">
       <label>Name<input id="cf-name" type="text" placeholder="Mein Server" /></label>
-      <label>Endpoint URL<input id="cf-url" type="text" placeholder="opc.tcp://localhost:4840" /></label>
+      <label>Endpoint URL
+        <div style="display:flex;gap:6px">
+          <input id="cf-url" type="text" placeholder="opc.tcp://localhost:4840" style="flex:1" />
+          <button id="btn-discover" class="btn-secondary" style="white-space:nowrap;padding:6px 10px;font-size:12px">&#128269; Entdecken</button>
+        </div>
+      </label>
+      <!-- Discovered endpoints list (hidden by default) -->
+      <div id="discover-result" style="display:none">
+        <p style="font-size:11px;color:var(--text-dim);margin-bottom:4px">Gefundene Endpunkte – klicken zum Uebernehmen:</p>
+        <div id="discover-list" style="max-height:120px;overflow-y:auto;border:1px solid var(--border);border-radius:4px"></div>
+      </div>
       <label>Benutzername (optional)<input id="cf-username" type="text" /></label>
       <label>Passwort (optional)<input id="cf-password" type="password" /></label>
       <div class="form-row">
@@ -150,6 +169,25 @@
     <div class="modal-body"><div id="server-info-content"></div></div>
     <div class="modal-footer">
       <button class="btn-secondary modal-close" data-modal="modal-server-info">Schliessen</button>
+    </div>
+  </div>
+</div>
+
+<!-- SERVER DIAGNOSTICS MODAL -->
+<div id="modal-diag" class="modal hidden">
+  <div class="modal-box" style="max-width:860px;width:95vw">
+    <div class="modal-header">
+      <h2>&#128202; Server-Diagnose</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button id="btn-diag-refresh" class="icon-btn" title="Aktualisieren">&#8635; Aktualisieren</button>
+        <button class="modal-close" data-modal="modal-diag">&#10005;</button>
+      </div>
+    </div>
+    <div class="modal-body" style="padding:0">
+      <div id="diag-content" style="padding:14px"><p class="hint">Lade Diagnosedaten&#8230;</p></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary modal-close" data-modal="modal-diag">Schliessen</button>
     </div>
   </div>
 </div>

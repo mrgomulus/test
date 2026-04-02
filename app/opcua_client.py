@@ -99,6 +99,9 @@ HAS_CHILDREN_CLASSES = frozenset(
     {"Object", "View", "ObjectType", "VariableType", "DataType", "ReferenceType"}
 )
 
+# Maximum number of historical values that may be fetched in a single call
+_MAX_HISTORY_VALUES: int = 10_000
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -645,6 +648,261 @@ class OPCUAManager:
                 await sub.unsubscribe(handle)
             except Exception:
                 pass
+
+    # ── Server diagnostics ────────────────────────────────────────────────
+
+    async def get_server_diagnostics(self, conn_id: int) -> dict:
+        """Read comprehensive OPC UA server diagnostics (sessions, subscriptions, capabilities)."""
+        client = self.get_client(conn_id)
+        diag: dict[str, Any] = {}
+
+        # ServiceLevel i=2267 – 0..255; ≥200 = nominal, ≥100 = degraded
+        try:
+            sl = await client.get_node("i=2267").read_value()
+            sl_int = int(sl)
+            diag["service_level"] = sl_int
+            diag["service_level_text"] = (
+                "Gut" if sl_int >= 200
+                else "Eingeschränkt" if sl_int >= 100
+                else "Nicht verfügbar"
+            )
+        except Exception:
+            pass
+
+        # Auditing i=2994
+        try:
+            diag["auditing_enabled"] = bool(
+                await client.get_node("i=2994").read_value()
+            )
+        except Exception:
+            pass
+
+        # ServerDiagnosticsSummary i=3706 (structured variable)
+        _SUMMARY_FIELDS = [
+            "ServerViewCount", "CurrentSessionCount", "CumulatedSessionCount",
+            "SecurityRejectedSessionCount", "RejectedSessionCount",
+            "SessionTimeoutCount", "SessionAbortCount",
+            "CurrentSubscriptionCount", "CumulatedSubscriptionCount",
+            "PublishingIntervalCount", "SecurityRejectedRequestsCount",
+            "RejectedRequestsCount",
+        ]
+        try:
+            summary = await client.get_node("i=3706").read_value()
+            if summary:
+                diag["diagnostics_summary"] = {
+                    f: int(getattr(summary, f, 0) or 0)
+                    for f in _SUMMARY_FIELDS
+                    if getattr(summary, f, None) is not None
+                }
+        except Exception:
+            pass
+
+        # SubscriptionDiagnosticsArray i=2290
+        _SUB_FIELDS = [
+            "SubscriptionId", "Priority", "PublishingInterval",
+            "MaxKeepAliveCount", "MaxLifetimeCount", "MaxNotificationsPerPublish",
+            "PublishingEnabled", "ModifyCount", "EnableCount", "DisableCount",
+            "RepublishRequestCount", "NotificationsCount",
+            "DataChangeNotificationsCount", "EventNotificationsCount",
+            "UnacknowledgedMessageCount", "CurrentMonitoredItemsCount",
+        ]
+        try:
+            sub_arr = await client.get_node("i=2290").read_value()
+            subs: list[dict] = []
+            for sd in sub_arr or []:
+                entry: dict[str, Any] = {}
+                for f in _SUB_FIELDS:
+                    v = getattr(sd, f, None)
+                    if v is not None:
+                        entry[f] = _serialize(v)
+                if entry:
+                    subs.append(entry)
+            if subs:
+                diag["subscription_diagnostics"] = subs
+        except Exception:
+            pass
+
+        # SessionDiagnosticsArray i=3129
+        _SESS_FIELDS = [
+            "SessionId", "SessionName", "ServerUri", "EndpointUrl",
+            "ActualSessionTimeout", "MaxResponseMessageSize",
+            "ClientConnectionTime", "ClientLastContactTime",
+            "CurrentSubscriptionsCount", "CurrentMonitoredItemsCount",
+            "CurrentPublishRequestsInQueue", "TotalRequestCount",
+        ]
+        try:
+            sess_arr = await client.get_node("i=3129").read_value()
+            sessions: list[dict] = []
+            for s in sess_arr or []:
+                entry = {}
+                for f in _SESS_FIELDS:
+                    v = getattr(s, f, None)
+                    if v is not None:
+                        entry[f] = _serialize(v)
+                cd = getattr(s, "ClientDescription", None)
+                if cd:
+                    entry["ClientDescription"] = {
+                        "ApplicationName": _serialize(
+                            getattr(cd, "ApplicationName", "")
+                        ),
+                        "ApplicationUri": str(getattr(cd, "ApplicationUri", "")),
+                        "ApplicationType": str(getattr(cd, "ApplicationType", "")),
+                    }
+                if entry:
+                    sessions.append(entry)
+            if sessions:
+                diag["session_diagnostics"] = sessions
+        except Exception:
+            pass
+
+        # Operation limits (well-known capability nodes)
+        _CAP_NODES: dict[str, str] = {
+            "MaxBrowseContinuationPoints": "i=2740",
+            "MaxQueryContinuationPoints": "i=2741",
+            "MaxHistoryContinuationPoints": "i=2742",
+            "MaxArrayLength": "i=11702",
+            "MaxStringLength": "i=11703",
+            "MaxByteStringLength": "i=12911",
+            "MaxNodesPerRead": "i=11705",
+            "MaxNodesPerWrite": "i=11707",
+            "MaxNodesPerMethodCall": "i=11709",
+            "MaxNodesPerBrowse": "i=11710",
+            "MaxNodesPerTranslateBrowsePathsToNodeIds": "i=11712",
+            "MaxMonitoredItemsPerCall": "i=11714",
+            "MinSupportedSampleRate": "i=2278",
+        }
+        caps: dict[str, Any] = {}
+        for name, nid in _CAP_NODES.items():
+            try:
+                v = await client.get_node(nid).read_value()
+                caps[name] = _serialize(v)
+            except Exception:
+                pass
+        if caps:
+            diag["server_capabilities"] = caps
+
+        # ServerProfileArray i=2272
+        try:
+            profiles = await client.get_node("i=2272").read_value()
+            if profiles:
+                diag["server_profiles"] = [str(p) for p in profiles]
+        except Exception:
+            pass
+
+        # LocaleIdArray i=2273
+        try:
+            locales = await client.get_node("i=2273").read_value()
+            if locales:
+                diag["locale_ids"] = [str(lc) for lc in locales]
+        except Exception:
+            pass
+
+        return diag
+
+    # ── History ───────────────────────────────────────────────────────────
+
+    async def read_history(
+        self,
+        conn_id: int,
+        node_id: str,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        max_values: int = 200,
+    ) -> list[dict]:
+        """Read raw historical values for a Variable node."""
+        from datetime import timezone
+
+        node = self.get_client(conn_id).get_node(node_id)
+
+        start_dt = (
+            datetime.fromisoformat(start_time).replace(tzinfo=timezone.utc)
+            if start_time
+            else datetime(1970, 1, 1, tzinfo=timezone.utc)
+        )
+        end_dt = (
+            datetime.fromisoformat(end_time).replace(tzinfo=timezone.utc)
+            if end_time
+            else datetime.now(timezone.utc)
+        )
+
+        history = await node.read_raw_history(
+            starttime=start_dt,
+            endtime=end_dt,
+            numvalues=max(1, min(max_values, _MAX_HISTORY_VALUES)),
+        )
+        results = []
+        for dv in history:
+            results.append(
+                {
+                    "value": _serialize(dv.Value.Value) if dv.Value else None,
+                    "status_code": dv.StatusCode.name if dv.StatusCode else "Good",
+                    "status_code_value": (
+                        dv.StatusCode.value if dv.StatusCode else 0
+                    ),
+                    "source_timestamp": (
+                        dv.SourceTimestamp.isoformat()
+                        if dv.SourceTimestamp
+                        else None
+                    ),
+                    "server_timestamp": (
+                        dv.ServerTimestamp.isoformat()
+                        if dv.ServerTimestamp
+                        else None
+                    ),
+                }
+            )
+        return results
+
+    # ── Endpoint discovery ────────────────────────────────────────────────
+
+    @staticmethod
+    async def discover_endpoints(url: str, timeout: int = 10) -> list[dict]:
+        """Discover available endpoints on an OPC UA server (no session required)."""
+        client = Client(url=url, timeout=timeout)
+        try:
+            endpoints = await client.get_endpoints()
+        except Exception:
+            # Fallback: try connecting briefly
+            try:
+                await client.connect()
+                endpoints = await client.get_endpoints()
+                await client.disconnect()
+            except Exception:
+                raise
+        result = []
+        for ep in endpoints:
+            result.append(
+                {
+                    "endpoint_url": ep.EndpointUrl or "",
+                    "security_mode": (
+                        ep.SecurityMode.name if ep.SecurityMode else "None"
+                    ),
+                    "security_policy": (
+                        str(ep.SecurityPolicyUri).split("#")[-1]
+                        if ep.SecurityPolicyUri
+                        else "None"
+                    ),
+                    "transport_profile": (
+                        str(ep.TransportProfileUri).split("/")[-1]
+                        if ep.TransportProfileUri
+                        else ""
+                    ),
+                    "server_name": (
+                        ep.Server.ApplicationName.Text
+                        if ep.Server and ep.Server.ApplicationName
+                        else ""
+                    ),
+                    "server_uri": (
+                        ep.Server.ApplicationUri if ep.Server else ""
+                    ),
+                    "security_level": (
+                        int(ep.SecurityLevel)
+                        if hasattr(ep, "SecurityLevel") and ep.SecurityLevel is not None
+                        else 0
+                    ),
+                }
+            )
+        return result
 
 
 # ── Type coercion helper ─────────────────────────────────────────────────────

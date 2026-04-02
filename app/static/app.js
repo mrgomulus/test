@@ -119,6 +119,8 @@ async function selectConnection(id) {
   if (!c) return;
   $('status-text').textContent = `Verbindung: ${c.name} (${c.url})`;
   $('status-text').className = c.connected ? 'status-connected' : 'status-idle';
+  // Show/hide diagnostics button
+  $('btn-open-diagnostics').style.display = c.connected ? '' : 'none';
   if (c.connected) {
     await loadFavorites();
     await refreshTree();
@@ -167,6 +169,7 @@ function openConnectionModal(existing = null) {
   $('cf-security-policy').value = existing?.security_policy || 'None';
   $('cf-timeout').value = existing?.timeout || 10;
   $('cf-description').value = existing?.description || '';
+  $('discover-result').style.display = 'none';
   $('modal-conn').classList.remove('hidden');
   $('modal-conn').dataset.editId = existing?.id || '';
   $('cf-name').focus();
@@ -392,6 +395,11 @@ async function selectNode(nodeInfo) {
 async function loadNodeDetail(nodeId) {
   if (!activeConnId || !nodeId) return;
   $('detail-content').innerHTML = '<p class="hint">Lade…</p>';
+  // History and nodediag tabs have their own loaders
+  if (currentTab === 'history') {
+    renderHistoryTab({ node_id: nodeId, attributes: {} });
+    return;
+  }
   try {
     const data = await apiFetch(`/api/attributes?conn_id=${activeConnId}&node_id=${encodeURIComponent(nodeId)}`);
     renderDetail(data);
@@ -405,6 +413,8 @@ function renderDetail(data) {
   if (currentTab === 'attributes') renderAttributes(data);
   else if (currentTab === 'value') renderValue(data);
   else if (currentTab === 'references') renderReferences(data);
+  else if (currentTab === 'history') renderHistoryTab(data);
+  else if (currentTab === 'nodediag') renderNodeDiagnose(data);
 }
 
 function renderAttributes(data) {
@@ -787,6 +797,447 @@ async function toggleSubscription(nodeId) {
   }
 }
 
+// ── Tree search ───────────────────────────────────────────────────────────
+async function treeSearch() {
+  const q = $('tree-search').value.trim();
+  if (!q || !activeConnId) return;
+  logMsg(`Suche: ${q}`, 'info');
+  try {
+    // Try direct node-ID lookup first
+    const data = await apiFetch(`/api/attributes?conn_id=${activeConnId}&node_id=${encodeURIComponent(q)}`);
+    const fakeNode = {
+      node_id: q,
+      display_name: data.attributes?.DisplayName || q,
+      node_class: data.attributes?.NodeClass || '',
+      icon: 'node',
+      has_children: false,
+    };
+    selectedNode = fakeNode;
+    $('btn-fav-toggle').style.display = '';
+    const isFav = favorites.some(f => f.node_id === q);
+    $('btn-fav-toggle').classList.toggle('active', isFav);
+    renderDetail(data);
+    logMsg(`Gefunden: ${data.attributes?.DisplayName || q}`, 'success');
+  } catch (ex) {
+    logMsg(`Suche fehlgeschlagen: ${ex.message}`, 'error');
+    toast(`Nicht gefunden: ${q}`, 'error');
+  }
+}
+
+// ── History tab ───────────────────────────────────────────────────────────
+function renderHistoryTab(data) {
+  const nc = data.attributes?.NodeClass;
+  const nodeId = data.node_id || selectedNode?.node_id;
+  if (!nodeId) { $('detail-content').innerHTML = '<p class="hint">Knoten auswaehlen</p>'; return; }
+
+  // Build controls
+  const now = new Date();
+  const startDefault = new Date(now.getTime() - 3600000 /* 1 hour ms */).toISOString().slice(0,16);
+  const endDefault = now.toISOString().slice(0,16);
+  const container = $('detail-content');
+
+  const ctrl = document.createElement('div');
+  ctrl.className = 'history-controls';
+  ctrl.innerHTML = `
+    <label>Von<input id="hist-start" type="datetime-local" value="${startDefault}" /></label>
+    <label>Bis<input id="hist-end" type="datetime-local" value="${endDefault}" /></label>
+    <label>Max. Werte<input id="hist-max" type="number" value="200" min="1" max="10000" style="width:80px" /></label>`;
+  const loadBtn = document.createElement('button');
+  loadBtn.className = 'btn-primary';
+  loadBtn.style.cssText = 'align-self:flex-end;padding:6px 14px;font-size:12px';
+  loadBtn.textContent = 'Laden';
+  ctrl.appendChild(loadBtn);
+  container.innerHTML = '';
+  container.appendChild(ctrl);
+
+  const statsDiv = document.createElement('div');
+  statsDiv.id = 'hist-stats';
+  statsDiv.className = 'history-stats';
+  container.appendChild(statsDiv);
+
+  const tableWrap = document.createElement('div');
+  tableWrap.id = 'history-table-wrap';
+  container.appendChild(tableWrap);
+
+  if (nc && nc !== 'Variable') {
+    statsDiv.textContent = 'Verlauf nur für Variable-Knoten verfügbar.';
+  }
+
+  loadBtn.addEventListener('click', async () => {
+    const start = $('hist-start')?.value ? new Date($('hist-start').value).toISOString() : null;
+    const end = $('hist-end')?.value ? new Date($('hist-end').value).toISOString() : null;
+    const maxVal = parseInt($('hist-max')?.value || '200');
+    tableWrap.innerHTML = '<p class="hint">Lade Verlauf…</p>';
+    statsDiv.innerHTML = '';
+    logMsg(`Verlauf laden: ${nodeId}`, 'info');
+    try {
+      let url = `/api/history?conn_id=${activeConnId}&node_id=${encodeURIComponent(nodeId)}&max_values=${maxVal}`;
+      if (start) url += `&start=${encodeURIComponent(start)}`;
+      if (end) url += `&end=${encodeURIComponent(end)}`;
+      const rows = await apiFetch(url);
+      renderHistoryTable(rows, tableWrap, statsDiv);
+      logMsg(`Verlauf geladen: ${rows.length} Eintraege`, 'success');
+    } catch (ex) {
+      tableWrap.innerHTML = `<p class="hint" style="color:var(--red)">${escHtml(ex.message)}</p>`;
+      logMsg(`Verlauf Fehler: ${ex.message}`, 'error');
+    }
+  });
+}
+
+function renderHistoryTable(rows, container, statsEl) {
+  if (!rows.length) {
+    container.innerHTML = '<p class="hint">Keine historischen Daten gefunden</p>';
+    statsEl.textContent = '0 Eintraege';
+    return;
+  }
+  // Compute statistics in a single pass for numeric values
+  const nums = rows.map(r => r.value).filter(v => typeof v === 'number');
+  let statsHtml = `<span>Eintraege: <strong>${rows.length}</strong></span>`;
+  if (nums.length) {
+    let mn = nums[0], mx = nums[0], sum = 0;
+    for (const v of nums) { if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+    const avg = sum / nums.length;
+    statsHtml += `<span>Min: <strong>${mn.toPrecision(6)}</strong></span>`;
+    statsHtml += `<span>Max: <strong>${mx.toPrecision(6)}</strong></span>`;
+    statsHtml += `<span>Avg: <strong>${avg.toPrecision(6)}</strong></span>`;
+  }
+  statsEl.innerHTML = statsHtml;
+
+  const table = document.createElement('table');
+  table.className = 'history-table';
+  table.innerHTML = '<thead><tr><th>#</th><th>Quelltimestamp</th><th>Servertimestamp</th><th>Wert</th><th>Status</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+  rows.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    const sc = r.status_code || 'Good';
+    const scClass = sc.startsWith('Good') ? 'sc-good' : 'sc-bad';
+    tr.innerHTML = `
+      <td class="ts">${i + 1}</td>
+      <td class="ts">${escHtml(r.source_timestamp || '–')}</td>
+      <td class="ts">${escHtml(r.server_timestamp || '–')}</td>
+      <td class="hval">${escHtml(JSON.stringify(r.value))}</td>
+      <td class="${scClass}">${escHtml(sc)}</td>`;
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  container.innerHTML = '';
+  container.appendChild(table);
+}
+
+// ── Node Diagnose tab ─────────────────────────────────────────────────────
+function renderNodeDiagnose(data) {
+  const a = data.attributes || {};
+  const nc = a.NodeClass || '–';
+  const container = $('detail-content');
+  let html = '';
+
+  // Identity
+  html += `<div class="nd-section">
+    <div class="nd-section-title">Knotenidentitaet</div>
+    <table class="diag-kv">
+      <tr><td>Knoten-ID</td><td>${escHtml(a.NodeId || data.node_id || '–')}</td></tr>
+      <tr><td>Knotenklasse</td><td>${escHtml(nc)}</td></tr>
+      <tr><td>BrowseName</td><td>${escHtml(a.BrowseName || '–')}</td></tr>
+      <tr><td>Anzeigename</td><td>${escHtml(a.DisplayName || '–')}</td></tr>
+      <tr><td>Beschreibung</td><td>${escHtml(a.Description || '–')}</td></tr>
+    </table>
+  </div>`;
+
+  if (nc === 'Variable' || nc === 'VariableType') {
+    const dt = a.DataType;
+    const al = a.AccessLevel;
+    const ual = a.UserAccessLevel;
+    const vr = a.ValueRank;
+    const msi = a.MinimumSamplingInterval;
+    const hist = a.Historizing;
+    const dv = data.data_value;
+    const scClass = dv?.status_code?.startsWith('Good') ? 'nd-badge-ok' : (dv?.status_code ? 'nd-badge-warn' : 'nd-badge-na');
+
+    html += `<div class="nd-section">
+      <div class="nd-section-title">Datentyp &amp; Wert</div>
+      <table class="diag-kv">
+        <tr><td>Datentyp</td><td>${dt ? escHtml(dt.name) + ` <span style="color:var(--text-dim);font-size:10px">(${escHtml(dt.node_id)})</span>` : '–'}</td></tr>
+        <tr><td>Wertebereich</td><td>${vr ? escHtml(vr.value + ' – ' + vr.meaning) : '–'}</td></tr>
+        <tr><td>Arraydimensionen</td><td>${escHtml(JSON.stringify(a.ArrayDimensions ?? null))}</td></tr>
+        <tr><td>Aktueller Wert</td><td>${dv && !dv.error ? escHtml(JSON.stringify(dv.value)) : '<em>N/A</em>'}</td></tr>
+        <tr><td>StatusCode</td><td><span class="nd-badge ${scClass}">${escHtml(dv?.status_code || 'N/A')}</span></td></tr>
+        <tr><td>Quelltimestamp</td><td>${escHtml(dv?.source_timestamp || '–')}</td></tr>
+        <tr><td>Servertimestamp</td><td>${escHtml(dv?.server_timestamp || '–')}</td></tr>
+      </table>
+    </div>
+    <div class="nd-section">
+      <div class="nd-section-title">Zugriff &amp; Sampling</div>
+      <table class="diag-kv">
+        <tr><td>AccessLevel</td><td>${al ? `${al.value} (${escHtml(al.readable)})` : '–'}</td></tr>
+        <tr><td>UserAccessLevel</td><td>${ual ? `${ual.value} (${escHtml(ual.readable)})` : '–'}</td></tr>
+        <tr><td>Min. Samplingintervall</td><td>${msi !== undefined ? escHtml(msi + ' ms') : '–'}</td></tr>
+        <tr><td>Historisierung</td><td><span class="nd-badge ${hist === true ? 'nd-badge-ok' : hist === false ? 'nd-badge-warn' : 'nd-badge-na'}">${hist === true ? 'Aktiv' : hist === false ? 'Inaktiv' : 'N/A'}</span></td></tr>
+        <tr><td>WriteMask</td><td>${escHtml(String(a.WriteMask ?? '–'))}</td></tr>
+        <tr><td>UserWriteMask</td><td>${escHtml(String(a.UserWriteMask ?? '–'))}</td></tr>
+      </table>
+    </div>`;
+  }
+
+  if (nc === 'Object') {
+    const en = a.EventNotifier;
+    html += `<div class="nd-section">
+      <div class="nd-section-title">Objekt-Eigenschaften</div>
+      <table class="diag-kv">
+        <tr><td>EventNotifier</td><td>${en ? escHtml(en.value + (en.subscribes_to_events ? ' – SubscribesToEvents' : '') + (en.history_readable ? ', HistoryReadable' : '')) : '–'}</td></tr>
+        <tr><td>WriteMask</td><td>${escHtml(String(a.WriteMask ?? '–'))}</td></tr>
+      </table>
+    </div>`;
+  }
+
+  if (nc === 'Method') {
+    html += `<div class="nd-section">
+      <div class="nd-section-title">Methoden-Eigenschaften</div>
+      <table class="diag-kv">
+        <tr><td>Executable</td><td><span class="nd-badge ${a.Executable ? 'nd-badge-ok' : 'nd-badge-warn'}">${escHtml(String(a.Executable ?? 'N/A'))}</span></td></tr>
+        <tr><td>UserExecutable</td><td><span class="nd-badge ${a.UserExecutable ? 'nd-badge-ok' : 'nd-badge-warn'}">${escHtml(String(a.UserExecutable ?? 'N/A'))}</span></td></tr>
+      </table>
+    </div>`;
+  }
+
+  if (['ObjectType','VariableType','DataType','ReferenceType'].includes(nc)) {
+    html += `<div class="nd-section">
+      <div class="nd-section-title">Typ-Eigenschaften</div>
+      <table class="diag-kv">
+        <tr><td>IsAbstract</td><td><span class="nd-badge ${a.IsAbstract ? 'nd-badge-warn' : 'nd-badge-ok'}">${escHtml(String(a.IsAbstract ?? 'N/A'))}</span></td></tr>
+        ${a.Symmetric !== undefined ? `<tr><td>Symmetric</td><td>${escHtml(String(a.Symmetric))}</td></tr>` : ''}
+        ${a.InverseName !== undefined ? `<tr><td>InverseName</td><td>${escHtml(a.InverseName)}</td></tr>` : ''}
+      </table>
+    </div>`;
+  }
+
+  // References summary
+  const refs = data.references || [];
+  const fwdCount = refs.filter(r => r.is_forward).length;
+  const bwdCount = refs.length - fwdCount;
+  html += `<div class="nd-section">
+    <div class="nd-section-title">Referenzen</div>
+    <table class="diag-kv">
+      <tr><td>Gesamt</td><td>${refs.length}</td></tr>
+      <tr><td>Vorwaertsreferenzen</td><td>${fwdCount}</td></tr>
+      <tr><td>Rueckwaertsreferenzen</td><td>${bwdCount}</td></tr>
+    </table>
+  </div>`;
+
+  container.innerHTML = html;
+}
+
+// ── Server Diagnostics modal ──────────────────────────────────────────────
+async function openDiagnosticsModal() {
+  if (!activeConnId) return;
+  $('modal-diag').classList.remove('hidden');
+  await loadServerDiagnostics();
+}
+
+async function loadServerDiagnostics() {
+  if (!activeConnId) return;
+  $('diag-content').innerHTML = '<p class="hint">Lade Diagnosedaten&#8230;</p>';
+  logMsg('Server-Diagnose laden…', 'info');
+  try {
+    const d = await apiFetch(`/api/diagnostics?conn_id=${activeConnId}`);
+    renderServerDiagnostics(d);
+    logMsg('Server-Diagnose geladen', 'success');
+  } catch (ex) {
+    $('diag-content').innerHTML = `<p class="hint" style="color:var(--red)">${escHtml(ex.message)}</p>`;
+    logMsg(`Diagnose Fehler: ${ex.message}`, 'error');
+  }
+}
+
+function renderServerDiagnostics(d) {
+  const container = $('diag-content');
+  let html = '';
+
+  // ── Service Level card ────────────────────────────────────────────────
+  if (d.service_level !== undefined) {
+    const sl = d.service_level;
+    const cls = sl >= 200 ? 'good' : sl >= 100 ? 'warn' : 'bad';
+    const fillColor = sl >= 200 ? 'var(--green)' : sl >= 100 ? 'var(--yellow)' : 'var(--red)';
+    html += `<div class="diag-section">
+      <div class="diag-section-title">Service-Level</div>
+      <div class="diag-grid">
+        <div class="diag-card">
+          <div class="diag-card-label">Service Level</div>
+          <div class="diag-card-value ${cls}">${sl}</div>
+          <div class="service-level-bar"><div class="service-level-fill" style="width:${sl/2.55}%;background:${fillColor}"></div></div>
+          <div class="diag-card-sub">${escHtml(d.service_level_text || '')}</div>
+        </div>
+        ${d.auditing_enabled !== undefined ? `<div class="diag-card"><div class="diag-card-label">Auditing</div><div class="diag-card-value ${d.auditing_enabled ? 'good' : 'warn'}">${d.auditing_enabled ? 'Aktiv' : 'Inaktiv'}</div></div>` : ''}
+      </div>
+    </div>`;
+  }
+
+  // ── Diagnostics summary counters ─────────────────────────────────────
+  if (d.diagnostics_summary) {
+    const s = d.diagnostics_summary;
+    const LABELS = {
+      ServerViewCount: ['Server-Views', ''],
+      CurrentSessionCount: ['Aktive Sitzungen', 'good'],
+      CumulatedSessionCount: ['Sitzungen gesamt', ''],
+      SecurityRejectedSessionCount: ['Sicherh. abgelehnt', 'bad'],
+      RejectedSessionCount: ['Sitzungen abgelehnt', 'warn'],
+      SessionTimeoutCount: ['Sitzungs-Timeouts', 'warn'],
+      SessionAbortCount: ['Sitzungen abgebrochen', 'warn'],
+      CurrentSubscriptionCount: ['Aktive Abonnements', 'good'],
+      CumulatedSubscriptionCount: ['Abonnements gesamt', ''],
+      PublishingIntervalCount: ['Pub.-Intervalle', ''],
+      SecurityRejectedRequestsCount: ['Anf. sicherh. abg.', 'bad'],
+      RejectedRequestsCount: ['Anf. abgelehnt', 'warn'],
+    };
+    html += `<div class="diag-section"><div class="diag-section-title">Diagnosezusammenfassung</div><div class="diag-grid">`;
+    for (const [key, [label, cls]] of Object.entries(LABELS)) {
+      if (key in s) {
+        html += `<div class="diag-card"><div class="diag-card-label">${label}</div><div class="diag-card-value ${cls}">${s[key]}</div></div>`;
+      }
+    }
+    html += '</div></div>';
+  }
+
+  // ── Subscription diagnostics table ───────────────────────────────────
+  if (d.subscription_diagnostics?.length) {
+    html += `<div class="diag-section"><div class="diag-section-title">Aktive Abonnements (${d.subscription_diagnostics.length})</div>`;
+    html += `<div style="overflow-x:auto"><table class="diag-sub-table"><thead><tr>
+      <th>Abo-ID</th><th>Prioritaet</th><th>Pub.-Intervall (ms)</th>
+      <th>Aktiv</th><th>Monitored Items</th><th>Benachrichtigungen</th><th>Max. Lebensdauer</th>
+    </tr></thead><tbody>`;
+    for (const sub of d.subscription_diagnostics) {
+      const pubOn = sub.PublishingEnabled === true || sub.PublishingEnabled === 'true';
+      html += `<tr>
+        <td>${escHtml(String(sub.SubscriptionId ?? '–'))}</td>
+        <td>${escHtml(String(sub.Priority ?? '–'))}</td>
+        <td>${escHtml(String(sub.PublishingInterval ?? '–'))}</td>
+        <td style="color:${pubOn ? 'var(--green)' : 'var(--red)'}">${pubOn ? '&#10003;' : '&#10007;'}</td>
+        <td>${escHtml(String(sub.CurrentMonitoredItemsCount ?? '–'))}</td>
+        <td>${escHtml(String(sub.NotificationsCount ?? '–'))}</td>
+        <td>${escHtml(String(sub.MaxLifetimeCount ?? '–'))}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div></div>';
+  }
+
+  // ── Session diagnostics table ─────────────────────────────────────────
+  if (d.session_diagnostics?.length) {
+    html += `<div class="diag-section"><div class="diag-section-title">Aktive Sitzungen (${d.session_diagnostics.length})</div>`;
+    html += `<div style="overflow-x:auto"><table class="diag-sub-table"><thead><tr>
+      <th>Sitzungsname</th><th>Endpoint</th><th>Verbunden seit</th>
+      <th>Letzter Kontakt</th><th>Abonnements</th><th>Mon. Items</th><th>Anfragen</th>
+    </tr></thead><tbody>`;
+    for (const s of d.session_diagnostics) {
+      html += `<tr>
+        <td>${escHtml(s.SessionName || '–')}</td>
+        <td style="font-size:10.5px">${escHtml(s.EndpointUrl || '–')}</td>
+        <td style="font-size:10.5px">${escHtml(s.ClientConnectionTime || '–')}</td>
+        <td style="font-size:10.5px">${escHtml(s.ClientLastContactTime || '–')}</td>
+        <td>${escHtml(String(s.CurrentSubscriptionsCount ?? '–'))}</td>
+        <td>${escHtml(String(s.CurrentMonitoredItemsCount ?? '–'))}</td>
+        <td>${escHtml(String(s.TotalRequestCount ?? '–'))}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div></div>';
+  }
+
+  // ── Server capabilities ───────────────────────────────────────────────
+  if (d.server_capabilities && Object.keys(d.server_capabilities).length) {
+    html += `<div class="diag-section"><div class="diag-section-title">Server-Faehigkeiten &amp; Grenzen</div>`;
+    html += `<table class="diag-kv">`;
+    for (const [k, v] of Object.entries(d.server_capabilities)) {
+      html += `<tr><td>${escHtml(k)}</td><td>${escHtml(String(v))}</td></tr>`;
+    }
+    html += `</table></div>`;
+  }
+
+  // ── Server profiles ───────────────────────────────────────────────────
+  if (d.server_profiles?.length) {
+    html += `<div class="diag-section"><div class="diag-section-title">Server-Profile</div>`;
+    html += d.server_profiles.map(p => `<span class="tag">${escHtml(p)}</span>`).join('');
+    html += '</div>';
+  }
+
+  // ── Locale IDs ────────────────────────────────────────────────────────
+  if (d.locale_ids?.length) {
+    html += `<div class="diag-section"><div class="diag-section-title">Sprachen</div>`;
+    html += d.locale_ids.map(l => `<span class="tag">${escHtml(l)}</span>`).join('');
+    html += '</div>';
+  }
+
+  if (!html) {
+    html = '<p class="hint">Keine Diagnosedaten verfuegbar (Server unterstuetzt Diagnose-Knoten moeglicherweise nicht)</p>';
+  }
+
+  container.innerHTML = html;
+}
+
+// ── Endpoint discovery ────────────────────────────────────────────────────
+async function discoverEndpoints() {
+  const url = $('cf-url').value.trim();
+  if (!url) { toast('Bitte zuerst Endpoint URL eingeben', 'error'); return; }
+  const timeout = parseInt($('cf-timeout').value) || 10;
+  const btn = $('btn-discover');
+  btn.textContent = '⏳ Suche…';
+  btn.disabled = true;
+  $('discover-result').style.display = 'none';
+  logMsg(`Endpoint-Entdeckung: ${url}`, 'info');
+  try {
+    const eps = await apiFetch(`/api/discover?url=${encodeURIComponent(url)}&timeout=${timeout}`);
+    renderDiscoveredEndpoints(eps);
+    logMsg(`${eps.length} Endpunkt(e) gefunden`, 'success');
+  } catch (ex) {
+    toast(`Entdeckung fehlgeschlagen: ${ex.message}`, 'error');
+    logMsg(`Entdeckung Fehler: ${ex.message}`, 'error');
+  } finally {
+    btn.textContent = '🔍 Entdecken';
+    btn.disabled = false;
+  }
+}
+
+function renderDiscoveredEndpoints(eps) {
+  const list = $('discover-list');
+  list.innerHTML = '';
+  if (!eps.length) {
+    list.innerHTML = '<p class="hint" style="padding:8px">Keine Endpunkte gefunden</p>';
+    $('discover-result').style.display = '';
+    return;
+  }
+  eps.forEach(ep => {
+    const div = document.createElement('div');
+    div.className = 'discover-ep';
+    const secClass = ep.security_mode === 'SignAndEncrypt'
+      ? 'sec-signencrypt' : ep.security_mode === 'Sign'
+      ? 'sec-sign' : 'sec-none';
+    const urlEl = document.createElement('div');
+    urlEl.className = 'discover-ep-url';
+    urlEl.textContent = ep.endpoint_url;
+    const metaEl = document.createElement('div');
+    metaEl.className = 'discover-ep-meta';
+    const secSpan = document.createElement('span');
+    secSpan.className = secClass;
+    secSpan.textContent = `${ep.security_mode} / ${ep.security_policy}`;
+    metaEl.appendChild(secSpan);
+    if (ep.server_name) {
+      const nameSpan = document.createElement('span');
+      nameSpan.style.cssText = 'margin-left:10px';
+      nameSpan.textContent = ep.server_name;
+      metaEl.appendChild(nameSpan);
+    }
+    div.appendChild(urlEl);
+    div.appendChild(metaEl);
+    div.addEventListener('click', () => {
+      $('cf-url').value = ep.endpoint_url;
+      // Set security mode (map name to value)
+      const modeMap = { None: '1', Sign: '2', SignAndEncrypt: '3' };
+      $('cf-security-mode').value = modeMap[ep.security_mode] || '1';
+      $('cf-security-policy').value = ep.security_policy || 'None';
+      $('discover-result').style.display = 'none';
+      toast(`Endpunkt ausgewaehlt: ${ep.security_mode}/${ep.security_policy}`, 'info');
+    });
+    list.appendChild(div);
+  });
+  $('discover-result').style.display = '';
+}
+
 // ── Modal helpers ─────────────────────────────────────────────────────────
 function closeModal(id) {
   $(id).classList.add('hidden');
@@ -804,6 +1255,17 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btn-fav-toggle').addEventListener('click', toggleFavorite);
   $('btn-refresh-tree').addEventListener('click', refreshTree);
   $('btn-clear-log').addEventListener('click', () => { $('log-list').innerHTML = ''; });
+
+  // Tree search
+  $('btn-tree-search').addEventListener('click', treeSearch);
+  $('tree-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') treeSearch(); });
+
+  // Diagnostics modal
+  $('btn-open-diagnostics').addEventListener('click', openDiagnosticsModal);
+  $('btn-diag-refresh').addEventListener('click', loadServerDiagnostics);
+
+  // Endpoint discovery
+  $('btn-discover').addEventListener('click', discoverEndpoints);
 
   // Tab switching
   document.querySelectorAll('.tab-btn').forEach(btn => {

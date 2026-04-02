@@ -333,6 +333,54 @@ def delete_favorite(fav_id: int):
         conn.close()
 
 
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+
+@app.get("/api/diagnostics")
+async def get_diagnostics(conn_id: int):
+    _require_connection(conn_id)
+    try:
+        return await opcua_manager.get_server_diagnostics(conn_id)
+    except Exception as exc:
+        logger.warning("Diagnostics error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+# ── History ───────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/history")
+async def read_history(
+    conn_id: int,
+    node_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    max_values: int = 200,
+):
+    _require_connection(conn_id)
+    try:
+        return await opcua_manager.read_history(
+            conn_id, node_id, start, end, max_values
+        )
+    except Exception as exc:
+        logger.warning("History error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
+# ── Endpoint discovery ────────────────────────────────────────────────────────
+
+
+@app.get("/api/discover")
+async def discover_endpoints(url: str, timeout: int = 10):
+    try:
+        from app.opcua_client import OPCUAManager
+
+        return await OPCUAManager.discover_endpoints(url, timeout)
+    except Exception as exc:
+        logger.warning("Endpoint discovery error: %s", exc)
+        raise HTTPException(status_code=502, detail=_safe_err(exc))
+
+
 # ── WebSocket subscriptions ───────────────────────────────────────────────────
 
 
